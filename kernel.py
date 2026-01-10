@@ -4,8 +4,6 @@ import os
 import time
 import subprocess
 import json
-import shlex
-import shutil
 from typing import Dict, Any, List, Optional
 import sanitizer
 
@@ -14,12 +12,11 @@ ADB_PATH = "adb"  # Ensure adb is in your PATH
 MODEL = "gpt-4o"  # Or "gpt-4-turbo" for faster/cheaper execution
 SCREEN_DUMP_PATH = "/sdcard/window_dump.xml"
 LOCAL_DUMP_PATH = "window_dump.xml"
-GEMINI_CLI_COMMAND = os.environ.get("GEMINI_CLI_COMMAND")
-GEMINI_CLI_ARGS = os.environ.get("GEMINI_CLI_ARGS", "")
 OLLAMA_MODEL_DEFAULT = os.environ.get("OLLAMA_MODEL", "llama3.1")
 OLLAMA_HOST_DEFAULT = os.environ.get("OLLAMA_HOST")
 LOG_FILE_DEFAULT = os.environ.get("ANDROID_ACTION_LOG_FILE", "android_action_kernel.log")
 LOG_LEVEL_DEFAULT = os.environ.get("ANDROID_ACTION_LOG_LEVEL", "INFO")
+MAX_LLM_RETRIES_DEFAULT = 1
 
 SYSTEM_PROMPT = """
 You are an Android Driver Agent. Your job is to achieve the user's goal by navigating the UI.
@@ -28,9 +25,12 @@ You will receive:
 1. The User's Goal.
 2. A list of interactive UI elements (JSON) with their (x,y) center coordinates.
 
-You must output ONLY a valid JSON object with your next action.
+You must output ONLY a valid JSON object matching exactly one of the schemas below.
+Do not add extra keys (for example, "target" or "contact").
+Do not wrap the JSON in markdown or code fences.
+If the target contact is not visible, tap a visible search bar or "New chat" button first.
 
-Available Actions:
+Schemas (exact keys):
 - {"action": "tap", "coordinates": [x, y], "reason": "Why you are tapping"}
 - {"action": "type", "text": "Hello World", "reason": "Why you are typing"}
 - {"action": "home", "reason": "Go to home screen"}
@@ -43,6 +43,22 @@ Example Output:
 """
 
 ALLOWED_ACTIONS = {"tap", "type", "home", "back", "wait", "done"}
+ACTION_SCHEMA = {
+    "tap": {"action", "coordinates", "reason"},
+    "type": {"action", "text", "reason"},
+    "home": {"action", "reason"},
+    "back": {"action", "reason"},
+    "wait": {"action", "reason"},
+    "done": {"action", "reason"},
+}
+RETRY_PROMPT_TEMPLATE = (
+    "Your previous response was invalid: {error}. "
+    "Return ONLY one JSON object with exactly these keys: "
+    "tap -> action, coordinates, reason; "
+    "type -> action, text, reason; "
+    "home/back/wait/done -> action, reason. "
+    "No extra keys and no markdown."
+)
 
 LOGGER = logging.getLogger("android_action_kernel")
 
@@ -206,36 +222,6 @@ def execute_action(action: Dict[str, Any]):
     else:
         LOGGER.warning("Unknown action type: %s", act_type)
 
-def build_prompt(goal: str, screen_context: str) -> str:
-    return f"{SYSTEM_PROMPT.strip()}\n\nGOAL: {goal}\n\nSCREEN_CONTEXT:\n{screen_context}"
-
-def ensure_executable(command: str) -> str:
-    if os.path.dirname(command):
-        if os.path.exists(command):
-            return command
-        raise FileNotFoundError(f"Gemini CLI not found at '{command}'.")
-    resolved = shutil.which(command)
-    if resolved:
-        return resolved
-    raise FileNotFoundError(f"Gemini CLI '{command}' not found in PATH.")
-
-def resolve_gemini_command(gemini_cli_command: Optional[str]) -> str:
-    if gemini_cli_command:
-        return ensure_executable(gemini_cli_command)
-    if GEMINI_CLI_COMMAND:
-        return ensure_executable(GEMINI_CLI_COMMAND)
-    for candidate in ("gemini.cmd", "gemini"):
-        resolved = shutil.which(candidate)
-        if resolved:
-            return resolved
-    raise FileNotFoundError("Gemini CLI not found in PATH.")
-
-def resolve_gemini_args(gemini_cli_args: Optional[str]) -> List[str]:
-    raw_args = gemini_cli_args if gemini_cli_args is not None else GEMINI_CLI_ARGS
-    if not raw_args:
-        return []
-    return shlex.split(raw_args, posix=os.name != "nt")
-
 def _try_parse_action_json(text: str) -> Optional[Dict[str, Any]]:
     try:
         parsed = json.loads(text)
@@ -263,6 +249,21 @@ def _validate_action_payload(decision: Dict[str, Any]) -> None:
     action = decision.get("action")
     if action not in ALLOWED_ACTIONS:
         raise ValueError(f"Invalid action: {action!r}. Expected one of {sorted(ALLOWED_ACTIONS)}.")
+    allowed_keys = ACTION_SCHEMA[action]
+    decision_keys = set(decision.keys())
+    missing_keys = allowed_keys - decision_keys
+    if missing_keys:
+        raise ValueError(
+            f"Missing required keys for {action} action: {sorted(missing_keys)}."
+        )
+    extra_keys = decision_keys - allowed_keys
+    if extra_keys:
+        raise ValueError(
+            f"Unexpected keys for {action} action: {sorted(extra_keys)}."
+        )
+    reason = decision.get("reason")
+    if not isinstance(reason, str):
+        raise ValueError("Invalid 'reason' for action; expected a string.")
     if action == "tap":
         coords = decision.get("coordinates")
         if (
@@ -276,10 +277,33 @@ def _validate_action_payload(decision: Dict[str, Any]) -> None:
         if not isinstance(text, str):
             raise ValueError("Invalid 'text' for type action; expected a string.")
 
+def _strip_code_fences(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return text
+    lines = stripped.splitlines()
+    if len(lines) < 2:
+        return stripped
+    if not lines[0].startswith("```"):
+        return stripped
+    for i in range(len(lines) - 1, 0, -1):
+        if lines[i].strip().startswith("```"):
+            return "\n".join(lines[1:i]).strip()
+    return stripped
+
+def _build_retry_prompt(error: Exception) -> str:
+    return RETRY_PROMPT_TEMPLATE.format(error=error)
+
 def _parse_action_from_text(raw_text: str, provider: str) -> Dict[str, Any]:
-    parsed = _try_parse_action_json(raw_text)
+    if not raw_text or not raw_text.strip():
+        raise ValueError(f"{provider} response was empty.")
+    cleaned = _strip_code_fences(raw_text)
+    parsed = _try_parse_action_json(cleaned)
+    if parsed is None and cleaned != raw_text:
+        parsed = _try_parse_action_json(raw_text)
     if parsed is None:
-        raise ValueError(f"{provider} did not return valid JSON.")
+        preview = raw_text.strip().replace("\n", " ")[:200]
+        raise ValueError(f"{provider} did not return valid JSON. Preview: {preview!r}")
     if "action" not in parsed and "response" in parsed:
         parsed = _parse_wrapped_response(parsed.get("response"))
         if parsed is None:
@@ -287,13 +311,17 @@ def _parse_action_from_text(raw_text: str, provider: str) -> Dict[str, Any]:
     _validate_action_payload(parsed)
     return parsed
 
-def get_openai_decision(goal: str, screen_context: str) -> Dict[str, Any]:
+def get_openai_decision(
+    goal: str,
+    screen_context: str,
+    max_retries: int = MAX_LLM_RETRIES_DEFAULT,
+) -> Dict[str, Any]:
     """Sends screen context to OpenAI and asks for the next move."""
     try:
         from openai import OpenAI
     except ImportError as exc:
         raise RuntimeError(
-            "OpenAI SDK not installed. Install it or use --llm-provider gemini_cli."
+            "OpenAI SDK not installed. Install it or use --llm-provider ollama."
         ) from exc
 
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -301,105 +329,50 @@ def get_openai_decision(goal: str, screen_context: str) -> Dict[str, Any]:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"GOAL: {goal}\n\nSCREEN_CONTEXT:\n{screen_context}"},
     ]
-    LOGGER.debug("OpenAI request model=%s messages=%s", MODEL, json.dumps(messages, indent=2))
-    response = client.chat.completions.create(
-        model=MODEL,
-        response_format={"type": "json_object"},
-        messages=messages,
-    )
-
-    content = response.choices[0].message.content
-    LOGGER.debug("OpenAI response content: %s", content)
-    try:
-        decision = json.loads(content)
-    except json.JSONDecodeError:
-        LOGGER.error("OpenAI returned invalid JSON: %s", content)
-        raise
-    LOGGER.debug("OpenAI parsed decision: %s", decision)
-    return decision
-
-def get_gemini_cli_decision(
-    goal: str,
-    screen_context: str,
-    gemini_cli_command: Optional[str] = None,
-    gemini_cli_args: Optional[str] = None,
-    gemini_cli_prompt_arg: Optional[str] = None,
-    gemini_cli_prompt_positional: bool = False,
-) -> Dict[str, Any]:
-    """Sends screen context to Gemini CLI and asks for the next move."""
-    try:
-        command = resolve_gemini_command(gemini_cli_command)
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "Gemini CLI executable not found. Set --gemini-cli-command or add it to PATH."
-        ) from exc
-    args = resolve_gemini_args(gemini_cli_args)
-    command = [command] + args
-    prompt = build_prompt(goal, screen_context)
-    stdin_prompt = None
-    if gemini_cli_prompt_arg:
-        command = command + [gemini_cli_prompt_arg, prompt]
-    elif gemini_cli_prompt_positional:
-        command = command + [prompt]
-    else:
-        stdin_prompt = prompt
-    LOGGER.debug("Gemini CLI command: %s", format_command(command))
-    if stdin_prompt is not None:
-        LOGGER.debug("Gemini CLI prompt (stdin):\n%s", stdin_prompt)
-    else:
-        LOGGER.debug("Gemini CLI prompt (args): %s", prompt)
-    result = subprocess.run(command, input=stdin_prompt, capture_output=True, text=True)
-    LOGGER.debug("Gemini CLI return code: %s", result.returncode)
-    if result.stdout:
-        LOGGER.debug("Gemini CLI stdout: %s", result.stdout.strip())
-    if result.stderr:
-        LOGGER.debug("Gemini CLI stderr: %s", result.stderr.strip())
-    if result.returncode != 0:
-        LOGGER.error("Gemini CLI failed with exit code %s", result.returncode)
-        raise RuntimeError(
-            f"Gemini CLI failed with exit code {result.returncode}: {result.stderr.strip()}"
+    last_error = None
+    for attempt in range(max_retries + 1):
+        LOGGER.debug(
+            "OpenAI request attempt %d/%d model=%s messages=%s",
+            attempt + 1,
+            max_retries + 1,
+            MODEL,
+            json.dumps(messages, indent=2),
         )
-    output = result.stdout.strip()
-    try:
-        decision = json.loads(output)
-    except json.JSONDecodeError as exc:
-        stdout_preview = output[:400]
-        stderr_preview = (result.stderr or "").strip()[:400]
-        details = []
-        if stdout_preview:
-            details.append(f"stdout: {stdout_preview!r}")
-        if stderr_preview:
-            details.append(f"stderr: {stderr_preview!r}")
-        detail_text = " " + " ".join(details) if details else " (stdout was empty)"
-        LOGGER.error("Gemini CLI did not return valid JSON.%s", detail_text)
-        raise ValueError(
-            "Gemini CLI did not return valid JSON. Ensure the CLI is configured for JSON-only output."
-            + detail_text
-        ) from exc
-    if not isinstance(decision, dict):
-        LOGGER.error("Gemini CLI JSON root is not an object: %s", type(decision).__name__)
-        raise ValueError("Gemini CLI did not return a JSON object.")
-    if "action" not in decision and "response" in decision:
-        LOGGER.warning("Gemini CLI returned a wrapper response; parsing action JSON from 'response'.")
-        parsed = _parse_wrapped_response(decision.get("response"))
-        if parsed is None:
-            response_preview = str(decision.get("response"))[:400]
-            LOGGER.error("Gemini CLI response did not contain action JSON. response=%r", response_preview)
-            raise ValueError("Gemini CLI response did not contain action JSON in 'response'.")
-        decision = parsed
-    try:
-        _validate_action_payload(decision)
-    except ValueError as exc:
-        LOGGER.error("Gemini CLI action validation failed: %s", exc)
-        raise
-    LOGGER.debug("Gemini CLI parsed decision: %s", decision)
-    return decision
+        response = client.chat.completions.create(
+            model=MODEL,
+            response_format={"type": "json_object"},
+            messages=messages,
+        )
+
+        content = response.choices[0].message.content
+        LOGGER.debug("OpenAI response content: %s", content)
+        try:
+            if not isinstance(content, str):
+                raise ValueError("OpenAI response did not include message content.")
+            decision = _parse_action_from_text(content.strip(), "OpenAI")
+        except ValueError as exc:
+            last_error = exc
+            LOGGER.warning(
+                "OpenAI response invalid (attempt %d/%d): %s",
+                attempt + 1,
+                max_retries + 1,
+                exc,
+            )
+            if attempt >= max_retries:
+                break
+            messages.append({"role": "assistant", "content": content or ""})
+            messages.append({"role": "user", "content": _build_retry_prompt(exc)})
+            continue
+        LOGGER.debug("OpenAI parsed decision: %s", decision)
+        return decision
+    raise last_error or ValueError("OpenAI response invalid.")
 
 def get_ollama_decision(
     goal: str,
     screen_context: str,
     ollama_model: Optional[str] = None,
     ollama_host: Optional[str] = None,
+    max_retries: int = MAX_LLM_RETRIES_DEFAULT,
 ) -> Dict[str, Any]:
     """Sends screen context to Ollama (local HTTP) and asks for the next move."""
     try:
@@ -417,40 +390,85 @@ def get_ollama_decision(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"GOAL: {goal}\n\nSCREEN_CONTEXT:\n{screen_context}"},
     ]
-    LOGGER.debug("Ollama request model=%s host=%s", model, host or "default")
-    if host:
-        client = ollama.Client(host=host)
-        response = client.chat(model=model, messages=messages, stream=False)
-    else:
-        response = ollama.chat(model=model, messages=messages, stream=False)
-    content = None
-    if isinstance(response, dict):
-        message = response.get("message") or {}
-        content = message.get("content")
-    elif isinstance(response, str):
-        content = response
-    else:
-        message = getattr(response, "message", None)
-        if isinstance(message, dict):
+    client = ollama.Client(host=host) if host else None
+    use_format = True
+    last_error = None
+    for attempt in range(max_retries + 1):
+        LOGGER.debug(
+            "Ollama request attempt %d/%d model=%s host=%s",
+            attempt + 1,
+            max_retries + 1,
+            model,
+            host or "default",
+        )
+        try:
+            if host:
+                if use_format:
+                    response = client.chat(
+                        model=model,
+                        messages=messages,
+                        stream=False,
+                        format="json",
+                    )
+                else:
+                    response = client.chat(model=model, messages=messages, stream=False)
+            else:
+                if use_format:
+                    response = ollama.chat(
+                        model=model,
+                        messages=messages,
+                        stream=False,
+                        format="json",
+                    )
+                else:
+                    response = ollama.chat(model=model, messages=messages, stream=False)
+        except TypeError:
+            if not use_format:
+                raise
+            use_format = False
+            if host:
+                response = client.chat(model=model, messages=messages, stream=False)
+            else:
+                response = ollama.chat(model=model, messages=messages, stream=False)
+        content = None
+        if isinstance(response, dict):
+            message = response.get("message") or {}
             content = message.get("content")
+        elif isinstance(response, str):
+            content = response
         else:
-            content = getattr(message, "content", None)
-    if not isinstance(content, str):
-        LOGGER.error("Ollama response missing message content: %r", response)
-        raise ValueError("Ollama response did not include message content.")
-    LOGGER.debug("Ollama response content: %s", content)
-    decision = _parse_action_from_text(content.strip(), "Ollama")
-    LOGGER.debug("Ollama parsed decision: %s", decision)
-    return decision
+            message = getattr(response, "message", None)
+            if isinstance(message, dict):
+                content = message.get("content")
+            else:
+                content = getattr(message, "content", None)
+        LOGGER.debug("Ollama response content: %s", content)
+        try:
+            if not isinstance(content, str):
+                raise ValueError("Ollama response did not include message content.")
+            decision = _parse_action_from_text(content.strip(), "Ollama")
+        except ValueError as exc:
+            last_error = exc
+            LOGGER.warning(
+                "Ollama response invalid (attempt %d/%d): %s",
+                attempt + 1,
+                max_retries + 1,
+                exc,
+            )
+            if attempt >= max_retries:
+                break
+            if isinstance(content, str):
+                messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": _build_retry_prompt(exc)})
+            continue
+        LOGGER.debug("Ollama parsed decision: %s", decision)
+        return decision
+    raise last_error or ValueError("Ollama response invalid.")
 
 def get_llm_decision(
     goal: str,
     screen_context: str,
     llm_provider: str,
-    gemini_cli_command: Optional[str] = None,
-    gemini_cli_args: Optional[str] = None,
-    gemini_cli_prompt_arg: Optional[str] = None,
-    gemini_cli_prompt_positional: bool = False,
     ollama_model: Optional[str] = None,
     ollama_host: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -458,29 +476,16 @@ def get_llm_decision(
     LOGGER.info("Using LLM provider: %s", llm_provider)
     if llm_provider in {"openai_api", "openai"}:
         return get_openai_decision(goal, screen_context)
-    if llm_provider in {"gemini_cli", "gemini"}:
-        return get_gemini_cli_decision(
-            goal,
-            screen_context,
-            gemini_cli_command,
-            gemini_cli_args,
-            gemini_cli_prompt_arg,
-            gemini_cli_prompt_positional,
-        )
     if llm_provider in {"ollama", "ollama_http"}:
         return get_ollama_decision(goal, screen_context, ollama_model, ollama_host)
     raise ValueError(
-        f"Unknown LLM provider '{llm_provider}'. Use 'openai_api', 'gemini_cli', or 'ollama'."
+        f"Unknown LLM provider '{llm_provider}'. Use 'openai_api' or 'ollama'."
     )
 
 def run_agent(
     goal: str,
     max_steps=10,
     llm_provider: str = "openai_api",
-    gemini_cli_command: Optional[str] = None,
-    gemini_cli_args: Optional[str] = None,
-    gemini_cli_prompt_arg: Optional[str] = None,
-    gemini_cli_prompt_positional: bool = False,
     ollama_model: Optional[str] = None,
     ollama_host: Optional[str] = None,
 ):
@@ -509,10 +514,6 @@ def run_agent(
             goal,
             screen_context,
             llm_provider,
-            gemini_cli_command,
-            gemini_cli_args,
-            gemini_cli_prompt_arg,
-            gemini_cli_prompt_positional,
             ollama_model,
             ollama_host,
         )
@@ -530,28 +531,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm-provider",
         default="openai_api",
-        choices=["openai_api", "openai", "gemini_cli", "gemini", "ollama", "ollama_http"],
+        choices=["openai_api", "openai", "ollama", "ollama_http"],
         help="LLM backend to use.",
-    )
-    parser.add_argument(
-        "--gemini-cli-command",
-        default=None,
-        help="Gemini CLI executable path or name (auto-detects if omitted).",
-    )
-    parser.add_argument(
-        "--gemini-cli-args",
-        default=None,
-        help="Extra args to pass to Gemini CLI.",
-    )
-    parser.add_argument(
-        "--gemini-cli-prompt-arg",
-        default=None,
-        help="Flag to pass the prompt as an argument (e.g. --prompt or -p).",
-    )
-    parser.add_argument(
-        "--gemini-cli-prompt-positional",
-        action="store_true",
-        help="Pass the prompt as a positional argument instead of stdin.",
     )
     parser.add_argument(
         "--ollama-model",
@@ -582,10 +563,6 @@ if __name__ == "__main__":
     run_agent(
         GOAL,
         llm_provider=args.llm_provider,
-        gemini_cli_command=args.gemini_cli_command,
-        gemini_cli_args=args.gemini_cli_args,
-        gemini_cli_prompt_arg=args.gemini_cli_prompt_arg,
-        gemini_cli_prompt_positional=args.gemini_cli_prompt_positional,
         ollama_model=args.ollama_model,
         ollama_host=args.ollama_host,
     )
