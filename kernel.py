@@ -16,6 +16,8 @@ SCREEN_DUMP_PATH = "/sdcard/window_dump.xml"
 LOCAL_DUMP_PATH = "window_dump.xml"
 GEMINI_CLI_COMMAND = os.environ.get("GEMINI_CLI_COMMAND")
 GEMINI_CLI_ARGS = os.environ.get("GEMINI_CLI_ARGS", "")
+OLLAMA_MODEL_DEFAULT = os.environ.get("OLLAMA_MODEL", "llama3.1")
+OLLAMA_HOST_DEFAULT = os.environ.get("OLLAMA_HOST")
 LOG_FILE_DEFAULT = os.environ.get("ANDROID_ACTION_LOG_FILE", "android_action_kernel.log")
 LOG_LEVEL_DEFAULT = os.environ.get("ANDROID_ACTION_LOG_LEVEL", "INFO")
 
@@ -39,6 +41,8 @@ Available Actions:
 Example Output:
 {"action": "tap", "coordinates": [540, 1200], "reason": "Clicking the 'Connect' button"}
 """
+
+ALLOWED_ACTIONS = {"tap", "type", "home", "back", "wait", "done"}
 
 LOGGER = logging.getLogger("android_action_kernel")
 
@@ -232,6 +236,57 @@ def resolve_gemini_args(gemini_cli_args: Optional[str]) -> List[str]:
         return []
     return shlex.split(raw_args, posix=os.name != "nt")
 
+def _try_parse_action_json(text: str) -> Optional[Dict[str, Any]]:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+def _parse_wrapped_response(response: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(response, dict):
+        return response
+    if isinstance(response, str):
+        return _try_parse_action_json(response.strip())
+    return None
+
+def _validate_action_payload(decision: Dict[str, Any]) -> None:
+    action = decision.get("action")
+    if action not in ALLOWED_ACTIONS:
+        raise ValueError(f"Invalid action: {action!r}. Expected one of {sorted(ALLOWED_ACTIONS)}.")
+    if action == "tap":
+        coords = decision.get("coordinates")
+        if (
+            not isinstance(coords, list)
+            or len(coords) != 2
+            or not all(isinstance(value, (int, float)) for value in coords)
+        ):
+            raise ValueError("Invalid 'coordinates' for tap action; expected [x, y].")
+    if action == "type":
+        text = decision.get("text")
+        if not isinstance(text, str):
+            raise ValueError("Invalid 'text' for type action; expected a string.")
+
+def _parse_action_from_text(raw_text: str, provider: str) -> Dict[str, Any]:
+    parsed = _try_parse_action_json(raw_text)
+    if parsed is None:
+        raise ValueError(f"{provider} did not return valid JSON.")
+    if "action" not in parsed and "response" in parsed:
+        parsed = _parse_wrapped_response(parsed.get("response"))
+        if parsed is None:
+            raise ValueError(f"{provider} response did not contain action JSON in 'response'.")
+    _validate_action_payload(parsed)
+    return parsed
+
 def get_openai_decision(goal: str, screen_context: str) -> Dict[str, Any]:
     """Sends screen context to OpenAI and asks for the next move."""
     try:
@@ -321,7 +376,71 @@ def get_gemini_cli_decision(
             "Gemini CLI did not return valid JSON. Ensure the CLI is configured for JSON-only output."
             + detail_text
         ) from exc
+    if not isinstance(decision, dict):
+        LOGGER.error("Gemini CLI JSON root is not an object: %s", type(decision).__name__)
+        raise ValueError("Gemini CLI did not return a JSON object.")
+    if "action" not in decision and "response" in decision:
+        LOGGER.warning("Gemini CLI returned a wrapper response; parsing action JSON from 'response'.")
+        parsed = _parse_wrapped_response(decision.get("response"))
+        if parsed is None:
+            response_preview = str(decision.get("response"))[:400]
+            LOGGER.error("Gemini CLI response did not contain action JSON. response=%r", response_preview)
+            raise ValueError("Gemini CLI response did not contain action JSON in 'response'.")
+        decision = parsed
+    try:
+        _validate_action_payload(decision)
+    except ValueError as exc:
+        LOGGER.error("Gemini CLI action validation failed: %s", exc)
+        raise
     LOGGER.debug("Gemini CLI parsed decision: %s", decision)
+    return decision
+
+def get_ollama_decision(
+    goal: str,
+    screen_context: str,
+    ollama_model: Optional[str] = None,
+    ollama_host: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Sends screen context to Ollama (local HTTP) and asks for the next move."""
+    try:
+        import ollama
+    except ImportError as exc:
+        raise RuntimeError(
+            "Ollama SDK not installed. Install it with `pip install -U ollama`."
+        ) from exc
+
+    model = ollama_model or OLLAMA_MODEL_DEFAULT
+    if not model:
+        raise ValueError("Ollama model is required. Set --ollama-model or OLLAMA_MODEL.")
+    host = ollama_host or OLLAMA_HOST_DEFAULT
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"GOAL: {goal}\n\nSCREEN_CONTEXT:\n{screen_context}"},
+    ]
+    LOGGER.debug("Ollama request model=%s host=%s", model, host or "default")
+    if host:
+        client = ollama.Client(host=host)
+        response = client.chat(model=model, messages=messages, stream=False)
+    else:
+        response = ollama.chat(model=model, messages=messages, stream=False)
+    content = None
+    if isinstance(response, dict):
+        message = response.get("message") or {}
+        content = message.get("content")
+    elif isinstance(response, str):
+        content = response
+    else:
+        message = getattr(response, "message", None)
+        if isinstance(message, dict):
+            content = message.get("content")
+        else:
+            content = getattr(message, "content", None)
+    if not isinstance(content, str):
+        LOGGER.error("Ollama response missing message content: %r", response)
+        raise ValueError("Ollama response did not include message content.")
+    LOGGER.debug("Ollama response content: %s", content)
+    decision = _parse_action_from_text(content.strip(), "Ollama")
+    LOGGER.debug("Ollama parsed decision: %s", decision)
     return decision
 
 def get_llm_decision(
@@ -332,6 +451,8 @@ def get_llm_decision(
     gemini_cli_args: Optional[str] = None,
     gemini_cli_prompt_arg: Optional[str] = None,
     gemini_cli_prompt_positional: bool = False,
+    ollama_model: Optional[str] = None,
+    ollama_host: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Sends screen context to the configured LLM provider and asks for the next move."""
     LOGGER.info("Using LLM provider: %s", llm_provider)
@@ -346,7 +467,11 @@ def get_llm_decision(
             gemini_cli_prompt_arg,
             gemini_cli_prompt_positional,
         )
-    raise ValueError(f"Unknown LLM provider '{llm_provider}'. Use 'openai_api' or 'gemini_cli'.")
+    if llm_provider in {"ollama", "ollama_http"}:
+        return get_ollama_decision(goal, screen_context, ollama_model, ollama_host)
+    raise ValueError(
+        f"Unknown LLM provider '{llm_provider}'. Use 'openai_api', 'gemini_cli', or 'ollama'."
+    )
 
 def run_agent(
     goal: str,
@@ -356,6 +481,8 @@ def run_agent(
     gemini_cli_args: Optional[str] = None,
     gemini_cli_prompt_arg: Optional[str] = None,
     gemini_cli_prompt_positional: bool = False,
+    ollama_model: Optional[str] = None,
+    ollama_host: Optional[str] = None,
 ):
     LOGGER.info("Android Use Agent Started. Goal: %s", goal)
 
@@ -386,6 +513,8 @@ def run_agent(
             gemini_cli_args,
             gemini_cli_prompt_arg,
             gemini_cli_prompt_positional,
+            ollama_model,
+            ollama_host,
         )
         LOGGER.info("Decision: %s", decision.get("reason"))
 
@@ -401,7 +530,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm-provider",
         default="openai_api",
-        choices=["openai_api", "openai", "gemini_cli", "gemini"],
+        choices=["openai_api", "openai", "gemini_cli", "gemini", "ollama", "ollama_http"],
         help="LLM backend to use.",
     )
     parser.add_argument(
@@ -423,6 +552,16 @@ if __name__ == "__main__":
         "--gemini-cli-prompt-positional",
         action="store_true",
         help="Pass the prompt as a positional argument instead of stdin.",
+    )
+    parser.add_argument(
+        "--ollama-model",
+        default=None,
+        help="Ollama model name (defaults to OLLAMA_MODEL or 'llama3.1').",
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default=None,
+        help="Ollama host URL (defaults to OLLAMA_HOST).",
     )
     parser.add_argument(
         "--log-file",
@@ -447,4 +586,6 @@ if __name__ == "__main__":
         gemini_cli_args=args.gemini_cli_args,
         gemini_cli_prompt_arg=args.gemini_cli_prompt_arg,
         gemini_cli_prompt_positional=args.gemini_cli_prompt_positional,
+        ollama_model=args.ollama_model,
+        ollama_host=args.ollama_host,
     )
