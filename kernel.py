@@ -4,14 +4,18 @@ import os
 import time
 import subprocess
 import json
-from typing import Dict, Any, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+
 import sanitizer
 
 # --- CONFIGURATION ---
 ADB_PATH = "adb"  # Ensure adb is in your PATH
-MODEL = "gpt-4o"  # Or "gpt-4-turbo" for faster/cheaper execution
+OPENAI_MODEL_DEFAULT = os.environ.get("OPENAI_MODEL", "gpt-4o")  # Or "gpt-4-turbo" for faster/cheaper execution
 SCREEN_DUMP_PATH = "/sdcard/window_dump.xml"
 LOCAL_DUMP_PATH = "window_dump.xml"
+UI_WAIT_SECONDS = 2
+KEYEVENT_HOME = "KEYCODE_HOME"
+KEYEVENT_BACK = "KEYCODE_BACK"
 OLLAMA_MODEL_DEFAULT = os.environ.get("OLLAMA_MODEL", "llama3.1")
 OLLAMA_HOST_DEFAULT = os.environ.get("OLLAMA_HOST")
 LOG_FILE_DEFAULT = os.environ.get("ANDROID_ACTION_LOG_FILE", "android_action_kernel.log")
@@ -63,6 +67,19 @@ RETRY_PROMPT_TEMPLATE = (
     "home/back/wait/done -> action, reason. "
     "No extra keys and no markdown."
 )
+LLM_PROVIDER_ALIASES = {
+    "openai_api": "openai",
+    "openai": "openai",
+    "openrouter": "openrouter",
+    "openrouter_api": "openrouter",
+    "ollama": "ollama",
+    "ollama_http": "ollama",
+}
+
+ActionPayload = Dict[str, Any]
+Message = Dict[str, str]
+ActionHandler = Callable[[ActionPayload], None]
+RequestFn = Callable[[List[Message]], str]
 
 LOGGER = logging.getLogger("android_action_kernel")
 
@@ -157,32 +174,35 @@ def ensure_adb_device_connected() -> List[str]:
     LOGGER.info("ADB devices connected: %s", ", ".join(devices))
     return devices
 
-def get_screen_state() -> str:
+def get_screen_state(
+    screen_dump_path: str = SCREEN_DUMP_PATH,
+    local_dump_path: str = LOCAL_DUMP_PATH,
+) -> str:
     """Dumps the current UI XML and returns the sanitized JSON string."""
     # 1. Capture XML
-    LOGGER.debug("Dumping UI to %s", SCREEN_DUMP_PATH)
-    if os.path.exists(LOCAL_DUMP_PATH):
+    LOGGER.debug("Dumping UI to %s", screen_dump_path)
+    if os.path.exists(local_dump_path):
         try:
-            os.remove(LOCAL_DUMP_PATH)
+            os.remove(local_dump_path)
         except OSError as exc:
-            LOGGER.warning("Failed to remove stale UI dump %s: %s", LOCAL_DUMP_PATH, exc)
-    result = run_adb_command_result(["shell", "uiautomator", "dump", SCREEN_DUMP_PATH])
+            LOGGER.warning("Failed to remove stale UI dump %s: %s", local_dump_path, exc)
+    result = run_adb_command_result(["shell", "uiautomator", "dump", screen_dump_path])
     if result.returncode != 0:
         stderr = result.stderr.strip() or "unknown error"
         raise RuntimeError(f"ADB uiautomator dump failed: {stderr}")
 
     # 2. Pull to local
-    LOGGER.debug("Pulling UI dump to %s", LOCAL_DUMP_PATH)
-    result = run_adb_command_result(["pull", SCREEN_DUMP_PATH, LOCAL_DUMP_PATH])
+    LOGGER.debug("Pulling UI dump to %s", local_dump_path)
+    result = run_adb_command_result(["pull", screen_dump_path, local_dump_path])
     if result.returncode != 0:
         stderr = result.stderr.strip() or "unknown error"
         raise RuntimeError(f"ADB pull failed: {stderr}")
 
     # 3. Read & Sanitize
-    if not os.path.exists(LOCAL_DUMP_PATH):
-        raise RuntimeError(f"Could not capture screen. Missing {LOCAL_DUMP_PATH}")
+    if not os.path.exists(local_dump_path):
+        raise RuntimeError(f"Could not capture screen. Missing {local_dump_path}")
 
-    with open(LOCAL_DUMP_PATH, "r", encoding="utf-8") as f:
+    with open(local_dump_path, "r", encoding="utf-8") as f:
         xml_content = f.read()
         LOGGER.debug("UI dump size: %d bytes", len(xml_content))
 
@@ -192,41 +212,61 @@ def get_screen_state() -> str:
     LOGGER.debug("Screen context JSON:\n%s", screen_context)
     return screen_context
 
-def execute_action(action: Dict[str, Any]):
+def _handle_tap(action: ActionPayload) -> None:
+    coords = action.get("coordinates")
+    if not isinstance(coords, list) or len(coords) != 2:
+        LOGGER.warning("Invalid coordinates for tap action: %s", coords)
+        return
+    x, y = coords
+    LOGGER.info("Tapping: (%s, %s)", x, y)
+    run_adb_command(["shell", "input", "tap", str(x), str(y)])
+
+def _handle_type(action: ActionPayload) -> None:
+    raw_text = action.get("text")
+    if not isinstance(raw_text, str):
+        LOGGER.warning("Invalid text payload for type action: %s", raw_text)
+        return
+    text = raw_text.replace(" ", "%s")  # ADB requires %s for spaces
+    LOGGER.info("Typing: %s", raw_text)
+    LOGGER.debug("ADB type payload: %s", text)
+    run_adb_command(["shell", "input", "text", text])
+
+def _handle_home(action: ActionPayload) -> None:
+    LOGGER.info("Going Home")
+    run_adb_command(["shell", "input", "keyevent", KEYEVENT_HOME])
+
+def _handle_back(action: ActionPayload) -> None:
+    LOGGER.info("Going Back")
+    run_adb_command(["shell", "input", "keyevent", KEYEVENT_BACK])
+
+def _handle_wait(action: ActionPayload) -> None:
+    LOGGER.info("Waiting...")
+    time.sleep(UI_WAIT_SECONDS)
+
+def _handle_done(action: ActionPayload) -> None:
+    LOGGER.info("Goal achieved.")
+    raise SystemExit(0)
+
+ACTION_HANDLERS: Dict[str, ActionHandler] = {
+    "tap": _handle_tap,
+    "type": _handle_type,
+    "home": _handle_home,
+    "back": _handle_back,
+    "wait": _handle_wait,
+    "done": _handle_done,
+}
+
+def execute_action(action: ActionPayload):
     """Executes the action decided by the LLM."""
     act_type = action.get("action")
     LOGGER.info("Executing action: %s", action)
-
-    if act_type == "tap":
-        x, y = action.get("coordinates")
-        LOGGER.info("Tapping: (%s, %s)", x, y)
-        run_adb_command(["shell", "input", "tap", str(x), str(y)])
-
-    elif act_type == "type":
-        text = action.get("text").replace(" ", "%s") # ADB requires %s for spaces
-        LOGGER.info("Typing: %s", action.get("text"))
-        LOGGER.debug("ADB type payload: %s", text)
-        run_adb_command(["shell", "input", "text", text])
-
-    elif act_type == "home":
-        LOGGER.info("Going Home")
-        run_adb_command(["shell", "input", "keyevent", "KEYWORDS_HOME"])
-
-    elif act_type == "back":
-        LOGGER.info("Going Back")
-        run_adb_command(["shell", "input", "keyevent", "KEYWORDS_BACK"])
-
-    elif act_type == "wait":
-        LOGGER.info("Waiting...")
-        time.sleep(2)
-
-    elif act_type == "done":
-        LOGGER.info("Goal achieved.")
-        exit(0)
-    else:
+    handler = ACTION_HANDLERS.get(act_type)
+    if not handler:
         LOGGER.warning("Unknown action type: %s", act_type)
+        return
+    handler(action)
 
-def _try_parse_action_json(text: str) -> Optional[Dict[str, Any]]:
+def _try_parse_action_json(text: str) -> Optional[ActionPayload]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
@@ -242,14 +282,14 @@ def _try_parse_action_json(text: str) -> Optional[Dict[str, Any]]:
         return parsed
     return None
 
-def _parse_wrapped_response(response: Any) -> Optional[Dict[str, Any]]:
+def _parse_wrapped_response(response: Any) -> Optional[ActionPayload]:
     if isinstance(response, dict):
         return response
     if isinstance(response, str):
         return _try_parse_action_json(response.strip())
     return None
 
-def _validate_action_payload(decision: Dict[str, Any]) -> None:
+def _validate_action_payload(decision: ActionPayload) -> None:
     action = decision.get("action")
     if action not in ALLOWED_ACTIONS:
         raise ValueError(f"Invalid action: {action!r}. Expected one of {sorted(ALLOWED_ACTIONS)}.")
@@ -306,7 +346,7 @@ def _build_openrouter_headers(site_url: Optional[str], site_name: Optional[str])
         headers["X-Title"] = site_name
     return headers
 
-def _parse_action_from_text(raw_text: str, provider: str) -> Dict[str, Any]:
+def _parse_action_from_text(raw_text: str, provider: str) -> ActionPayload:
     if not raw_text or not raw_text.strip():
         raise ValueError(f"{provider} response was empty.")
     cleaned = _strip_code_fences(raw_text)
@@ -323,11 +363,94 @@ def _parse_action_from_text(raw_text: str, provider: str) -> Dict[str, Any]:
     _validate_action_payload(parsed)
     return parsed
 
+def _build_messages(goal: str, screen_context: str) -> List[Message]:
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"GOAL: {goal}\n\nSCREEN_CONTEXT:\n{screen_context}"},
+    ]
+
+def _log_request_attempt(
+    provider: str,
+    attempt: int,
+    max_retries: int,
+    log_context: Optional[Dict[str, Any]] = None,
+) -> None:
+    if log_context:
+        context = " ".join(f"{key}={value}" for key, value in log_context.items())
+        LOGGER.debug(
+            "%s request attempt %d/%d %s",
+            provider,
+            attempt + 1,
+            max_retries + 1,
+            context,
+        )
+    else:
+        LOGGER.debug("%s request attempt %d/%d", provider, attempt + 1, max_retries + 1)
+
+def _request_with_retries(
+    provider: str,
+    messages: List[Message],
+    max_retries: int,
+    request_fn: RequestFn,
+    log_context: Optional[Dict[str, Any]] = None,
+    log_messages: bool = False,
+) -> ActionPayload:
+    last_error = None
+    for attempt in range(max_retries + 1):
+        _log_request_attempt(provider, attempt, max_retries, log_context)
+        if log_messages:
+            LOGGER.debug("%s messages=%s", provider, json.dumps(messages, indent=2))
+        content = request_fn(messages)
+        LOGGER.debug("%s response content: %s", provider, content)
+        try:
+            if not isinstance(content, str):
+                raise ValueError(f"{provider} response did not include message content.")
+            decision = _parse_action_from_text(content.strip(), provider)
+        except ValueError as exc:
+            last_error = exc
+            LOGGER.warning(
+                "%s response invalid (attempt %d/%d): %s",
+                provider,
+                attempt + 1,
+                max_retries + 1,
+                exc,
+            )
+            if attempt >= max_retries:
+                break
+            if isinstance(content, str):
+                messages.append({"role": "assistant", "content": content})
+            else:
+                messages.append({"role": "assistant", "content": ""})
+            messages.append({"role": "user", "content": _build_retry_prompt(exc)})
+            continue
+        LOGGER.debug("%s parsed decision: %s", provider, decision)
+        return decision
+    raise last_error or ValueError(f"{provider} response invalid.")
+
+def _extract_ollama_content(response: Any) -> Optional[str]:
+    if isinstance(response, dict):
+        message = response.get("message") or {}
+        return message.get("content")
+    if isinstance(response, str):
+        return response
+    message = getattr(response, "message", None)
+    if isinstance(message, dict):
+        return message.get("content")
+    return getattr(message, "content", None)
+
+def _normalize_llm_provider(llm_provider: str) -> str:
+    provider = LLM_PROVIDER_ALIASES.get(llm_provider)
+    if not provider:
+        raise ValueError(
+            f"Unknown LLM provider '{llm_provider}'. Use 'openai_api', 'openrouter', or 'ollama'."
+        )
+    return provider
+
 def get_openai_decision(
     goal: str,
     screen_context: str,
     max_retries: int = MAX_LLM_RETRIES_DEFAULT,
-) -> Dict[str, Any]:
+) -> ActionPayload:
     """Sends screen context to OpenAI and asks for the next move."""
     try:
         from openai import OpenAI
@@ -336,46 +459,25 @@ def get_openai_decision(
             "OpenAI SDK not installed. Install it or use --llm-provider ollama."
         ) from exc
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"GOAL: {goal}\n\nSCREEN_CONTEXT:\n{screen_context}"},
-    ]
-    last_error = None
-    for attempt in range(max_retries + 1):
-        LOGGER.debug(
-            "OpenAI request attempt %d/%d model=%s messages=%s",
-            attempt + 1,
-            max_retries + 1,
-            MODEL,
-            json.dumps(messages, indent=2),
-        )
+    model = OPENAI_MODEL_DEFAULT
+    messages = _build_messages(goal, screen_context)
+
+    def _request(messages: List[Message]) -> str:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=model,
             response_format={"type": "json_object"},
             messages=messages,
         )
-        content = response.choices[0].message.content
-        LOGGER.debug("OpenAI response content: %s", content)
-        try:
-            if not isinstance(content, str):
-                raise ValueError("OpenAI response did not include message content.")
-            decision = _parse_action_from_text(content.strip(), "OpenAI")
-        except ValueError as exc:
-            last_error = exc
-            LOGGER.warning(
-                "OpenAI response invalid (attempt %d/%d): %s",
-                attempt + 1,
-                max_retries + 1,
-                exc,
-            )
-            if attempt >= max_retries:
-                break
-            messages.append({"role": "assistant", "content": content or ""})
-            messages.append({"role": "user", "content": _build_retry_prompt(exc)})
-            continue
-        LOGGER.debug("OpenAI parsed decision: %s", decision)
-        return decision
-    raise last_error or ValueError("OpenAI response invalid.")
+        return response.choices[0].message.content
+
+    return _request_with_retries(
+        "OpenAI",
+        messages,
+        max_retries,
+        _request,
+        log_context={"model": model},
+        log_messages=True,
+    )
 
 def get_openrouter_decision(
     goal: str,
@@ -386,7 +488,7 @@ def get_openrouter_decision(
     openrouter_site_url: Optional[str] = None,
     openrouter_site_name: Optional[str] = None,
     max_retries: int = MAX_LLM_RETRIES_DEFAULT,
-) -> Dict[str, Any]:
+) -> ActionPayload:
     """Sends screen context to OpenRouter and asks for the next move."""
     try:
         from openai import OpenAI
@@ -407,46 +509,23 @@ def get_openrouter_decision(
     if headers:
         client_kwargs["default_headers"] = headers
     client = OpenAI(**client_kwargs)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"GOAL: {goal}\n\nSCREEN_CONTEXT:\n{screen_context}"},
-    ]
-    last_error = None
-    for attempt in range(max_retries + 1):
-        LOGGER.debug(
-            "OpenRouter request attempt %d/%d model=%s base_url=%s",
-            attempt + 1,
-            max_retries + 1,
-            model,
-            base_url,
-        )
+    messages = _build_messages(goal, screen_context)
+
+    def _request(messages: List[Message]) -> str:
         response = client.chat.completions.create(
             model=model,
             response_format={"type": "json_object"},
             messages=messages,
         )
-        content = response.choices[0].message.content
-        LOGGER.debug("OpenRouter response content: %s", content)
-        try:
-            if not isinstance(content, str):
-                raise ValueError("OpenRouter response did not include message content.")
-            decision = _parse_action_from_text(content.strip(), "OpenRouter")
-        except ValueError as exc:
-            last_error = exc
-            LOGGER.warning(
-                "OpenRouter response invalid (attempt %d/%d): %s",
-                attempt + 1,
-                max_retries + 1,
-                exc,
-            )
-            if attempt >= max_retries:
-                break
-            messages.append({"role": "assistant", "content": content or ""})
-            messages.append({"role": "user", "content": _build_retry_prompt(exc)})
-            continue
-        LOGGER.debug("OpenRouter parsed decision: %s", decision)
-        return decision
-    raise last_error or ValueError("OpenRouter response invalid.")
+        return response.choices[0].message.content
+
+    return _request_with_retries(
+        "OpenRouter",
+        messages,
+        max_retries,
+        _request,
+        log_context={"model": model, "base_url": base_url},
+    )
 
 def get_ollama_decision(
     goal: str,
@@ -454,7 +533,7 @@ def get_ollama_decision(
     ollama_model: Optional[str] = None,
     ollama_host: Optional[str] = None,
     max_retries: int = MAX_LLM_RETRIES_DEFAULT,
-) -> Dict[str, Any]:
+) -> ActionPayload:
     """Sends screen context to Ollama (local HTTP) and asks for the next move."""
     try:
         import ollama
@@ -466,21 +545,12 @@ def get_ollama_decision(
     if not model:
         raise ValueError("Ollama model is required. Set --ollama-model or OLLAMA_MODEL.")
     host = ollama_host or OLLAMA_HOST_DEFAULT
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"GOAL: {goal}\n\nSCREEN_CONTEXT:\n{screen_context}"},
-    ]
+    messages = _build_messages(goal, screen_context)
     client = ollama.Client(host=host) if host else None
     use_format = True
-    last_error = None
-    for attempt in range(max_retries + 1):
-        LOGGER.debug(
-            "Ollama request attempt %d/%d model=%s host=%s",
-            attempt + 1,
-            max_retries + 1,
-            model,
-            host or "default",
-        )
+
+    def _request(messages: List[Message]) -> str:
+        nonlocal use_format
         try:
             if host:
                 if use_format:
@@ -510,40 +580,15 @@ def get_ollama_decision(
                 response = client.chat(model=model, messages=messages, stream=False)
             else:
                 response = ollama.chat(model=model, messages=messages, stream=False)
-        content = None
-        if isinstance(response, dict):
-            message = response.get("message") or {}
-            content = message.get("content")
-        elif isinstance(response, str):
-            content = response
-        else:
-            message = getattr(response, "message", None)
-            if isinstance(message, dict):
-                content = message.get("content")
-            else:
-                content = getattr(message, "content", None)
-        LOGGER.debug("Ollama response content: %s", content)
-        try:
-            if not isinstance(content, str):
-                raise ValueError("Ollama response did not include message content.")
-            decision = _parse_action_from_text(content.strip(), "Ollama")
-        except ValueError as exc:
-            last_error = exc
-            LOGGER.warning(
-                "Ollama response invalid (attempt %d/%d): %s",
-                attempt + 1,
-                max_retries + 1,
-                exc,
-            )
-            if attempt >= max_retries:
-                break
-            if isinstance(content, str):
-                messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user", "content": _build_retry_prompt(exc)})
-            continue
-        LOGGER.debug("Ollama parsed decision: %s", decision)
-        return decision
-    raise last_error or ValueError("Ollama response invalid.")
+        return _extract_ollama_content(response)
+
+    return _request_with_retries(
+        "Ollama",
+        messages,
+        max_retries,
+        _request,
+        log_context={"model": model, "host": host or "default"},
+    )
 
 def get_llm_decision(
     goal: str,
@@ -551,22 +596,21 @@ def get_llm_decision(
     llm_provider: str,
     ollama_model: Optional[str] = None,
     ollama_host: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> ActionPayload:
     """Sends screen context to the configured LLM provider and asks for the next move."""
-    LOGGER.info("Using LLM provider: %s", llm_provider)
-    if llm_provider in {"openai_api", "openai"}:
+    provider = _normalize_llm_provider(llm_provider)
+    LOGGER.info("Using LLM provider: %s", provider)
+    if provider == "openai":
         return get_openai_decision(goal, screen_context)
-    if llm_provider in {"openrouter", "openrouter_api"}:
+    if provider == "openrouter":
         return get_openrouter_decision(goal, screen_context)
-    if llm_provider in {"ollama", "ollama_http"}:
+    if provider == "ollama":
         return get_ollama_decision(goal, screen_context, ollama_model, ollama_host)
-    raise ValueError(
-        f"Unknown LLM provider '{llm_provider}'. Use 'openai_api', 'openrouter', or 'ollama'."
-    )
+    raise ValueError(f"Unknown LLM provider '{llm_provider}'.")
 
 def run_agent(
     goal: str,
-    max_steps=10,
+    max_steps: int = 10,
     llm_provider: str = "openai_api",
     ollama_model: Optional[str] = None,
     ollama_host: Optional[str] = None,
@@ -606,9 +650,9 @@ def run_agent(
 
         # Wait for UI to update
         LOGGER.debug("Waiting for UI to update...")
-        time.sleep(2)
+        time.sleep(UI_WAIT_SECONDS)
 
-if __name__ == "__main__":
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Android UI automation agent.")
     parser.add_argument(
         "--llm-provider",
@@ -636,15 +680,22 @@ if __name__ == "__main__":
         default=LOG_LEVEL_DEFAULT,
         help="Console log level (DEBUG, INFO, WARNING, ERROR).",
     )
-    args = parser.parse_args()
+    return parser
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
     setup_logging(args.log_file, args.log_level)
     # Example Goal: "Open settings and turn on Wi-Fi"
     # Or your demo goal: "Find the 'Connect' button and tap it"
-    GOAL = input("Enter your goal: ")
-    LOGGER.info("User goal: %s", GOAL)
+    goal = input("Enter your goal: ")
+    LOGGER.info("User goal: %s", goal)
     run_agent(
-        GOAL,
+        goal,
         llm_provider=args.llm_provider,
         ollama_model=args.ollama_model,
         ollama_host=args.ollama_host,
     )
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
