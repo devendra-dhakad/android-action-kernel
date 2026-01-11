@@ -17,7 +17,11 @@ OLLAMA_HOST_DEFAULT = os.environ.get("OLLAMA_HOST")
 LOG_FILE_DEFAULT = os.environ.get("ANDROID_ACTION_LOG_FILE", "android_action_kernel.log")
 LOG_LEVEL_DEFAULT = os.environ.get("ANDROID_ACTION_LOG_LEVEL", "INFO")
 MAX_LLM_RETRIES_DEFAULT = 1
-
+OPENROUTER_BASE_URL_DEFAULT = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_MODEL_DEFAULT = os.environ.get("OPENROUTER_MODEL", "gpt-oss-120b")
+OPENROUTER_API_KEY_DEFAULT = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_SITE_URL_DEFAULT = os.environ.get("OPENROUTER_SITE_URL")
+OPENROUTER_SITE_NAME_DEFAULT = os.environ.get("OPENROUTER_SITE_NAME")
 SYSTEM_PROMPT = """
 You are an Android Driver Agent. Your job is to achieve the user's goal by navigating the UI.
 
@@ -294,6 +298,14 @@ def _strip_code_fences(text: str) -> str:
 def _build_retry_prompt(error: Exception) -> str:
     return RETRY_PROMPT_TEMPLATE.format(error=error)
 
+def _build_openrouter_headers(site_url: Optional[str], site_name: Optional[str]) -> Dict[str, str]:
+    headers = {}
+    if site_url:
+        headers["HTTP-Referer"] = site_url
+    if site_name:
+        headers["X-Title"] = site_name
+    return headers
+
 def _parse_action_from_text(raw_text: str, provider: str) -> Dict[str, Any]:
     if not raw_text or not raw_text.strip():
         raise ValueError(f"{provider} response was empty.")
@@ -323,7 +335,6 @@ def get_openai_decision(
         raise RuntimeError(
             "OpenAI SDK not installed. Install it or use --llm-provider ollama."
         ) from exc
-
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -343,7 +354,6 @@ def get_openai_decision(
             response_format={"type": "json_object"},
             messages=messages,
         )
-
         content = response.choices[0].message.content
         LOGGER.debug("OpenAI response content: %s", content)
         try:
@@ -367,6 +377,77 @@ def get_openai_decision(
         return decision
     raise last_error or ValueError("OpenAI response invalid.")
 
+def get_openrouter_decision(
+    goal: str,
+    screen_context: str,
+    openrouter_model: Optional[str] = None,
+    openrouter_base_url: Optional[str] = None,
+    openrouter_api_key: Optional[str] = None,
+    openrouter_site_url: Optional[str] = None,
+    openrouter_site_name: Optional[str] = None,
+    max_retries: int = MAX_LLM_RETRIES_DEFAULT,
+) -> Dict[str, Any]:
+    """Sends screen context to OpenRouter and asks for the next move."""
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "OpenAI SDK not installed. Install it or use --llm-provider ollama."
+        ) from exc
+    api_key = openrouter_api_key or OPENROUTER_API_KEY_DEFAULT
+    if not api_key:
+        raise RuntimeError("OpenRouter API key not set. Set OPENROUTER_API_KEY.")
+    base_url = openrouter_base_url or OPENROUTER_BASE_URL_DEFAULT
+    model = openrouter_model or OPENROUTER_MODEL_DEFAULT
+    headers = _build_openrouter_headers(
+        openrouter_site_url or OPENROUTER_SITE_URL_DEFAULT,
+        openrouter_site_name or OPENROUTER_SITE_NAME_DEFAULT,
+    )
+    client_kwargs = {"api_key": api_key, "base_url": base_url}
+    if headers:
+        client_kwargs["default_headers"] = headers
+    client = OpenAI(**client_kwargs)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"GOAL: {goal}\n\nSCREEN_CONTEXT:\n{screen_context}"},
+    ]
+    last_error = None
+    for attempt in range(max_retries + 1):
+        LOGGER.debug(
+            "OpenRouter request attempt %d/%d model=%s base_url=%s",
+            attempt + 1,
+            max_retries + 1,
+            model,
+            base_url,
+        )
+        response = client.chat.completions.create(
+            model=model,
+            response_format={"type": "json_object"},
+            messages=messages,
+        )
+        content = response.choices[0].message.content
+        LOGGER.debug("OpenRouter response content: %s", content)
+        try:
+            if not isinstance(content, str):
+                raise ValueError("OpenRouter response did not include message content.")
+            decision = _parse_action_from_text(content.strip(), "OpenRouter")
+        except ValueError as exc:
+            last_error = exc
+            LOGGER.warning(
+                "OpenRouter response invalid (attempt %d/%d): %s",
+                attempt + 1,
+                max_retries + 1,
+                exc,
+            )
+            if attempt >= max_retries:
+                break
+            messages.append({"role": "assistant", "content": content or ""})
+            messages.append({"role": "user", "content": _build_retry_prompt(exc)})
+            continue
+        LOGGER.debug("OpenRouter parsed decision: %s", decision)
+        return decision
+    raise last_error or ValueError("OpenRouter response invalid.")
+
 def get_ollama_decision(
     goal: str,
     screen_context: str,
@@ -381,7 +462,6 @@ def get_ollama_decision(
         raise RuntimeError(
             "Ollama SDK not installed. Install it with `pip install -U ollama`."
         ) from exc
-
     model = ollama_model or OLLAMA_MODEL_DEFAULT
     if not model:
         raise ValueError("Ollama model is required. Set --ollama-model or OLLAMA_MODEL.")
@@ -476,10 +556,12 @@ def get_llm_decision(
     LOGGER.info("Using LLM provider: %s", llm_provider)
     if llm_provider in {"openai_api", "openai"}:
         return get_openai_decision(goal, screen_context)
+    if llm_provider in {"openrouter", "openrouter_api"}:
+        return get_openrouter_decision(goal, screen_context)
     if llm_provider in {"ollama", "ollama_http"}:
         return get_ollama_decision(goal, screen_context, ollama_model, ollama_host)
     raise ValueError(
-        f"Unknown LLM provider '{llm_provider}'. Use 'openai_api' or 'ollama'."
+        f"Unknown LLM provider '{llm_provider}'. Use 'openai_api', 'openrouter', or 'ollama'."
     )
 
 def run_agent(
@@ -531,7 +613,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm-provider",
         default="openai_api",
-        choices=["openai_api", "openai", "ollama", "ollama_http"],
+        choices=["openai_api", "openai", "openrouter", "openrouter_api", "ollama", "ollama_http"],
         help="LLM backend to use.",
     )
     parser.add_argument(
