@@ -1,2 +1,3 @@
 openai>=1.12.0
 ollama
+google-genai

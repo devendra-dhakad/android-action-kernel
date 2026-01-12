@@ -5,4 +5,5 @@ __all__ = [
     "openai_provider",
     "openrouter_provider",
     "ollama_provider",
+    "gemini_provider",
 ]

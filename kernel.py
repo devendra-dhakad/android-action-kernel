@@ -251,7 +251,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm-provider",
         default="openai",
-        choices=["openai", "openrouter", "ollama"],
+        choices=["openai", "openrouter", "ollama", "gemini"],
         help="LLM backend to use.",
     )
     parser.add_argument(

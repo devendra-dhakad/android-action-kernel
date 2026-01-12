@@ -5,6 +5,7 @@ from providers.llm_core import ActionPayload
 from providers.ollama_provider import get_ollama_decision
 from providers.openai_provider import get_openai_decision
 from providers.openrouter_provider import get_openrouter_decision
+from providers.gemini_provider import get_gemini_decision
 
 LOGGER = logging.getLogger("android_action_kernel")
 
@@ -15,9 +16,9 @@ def get_llm_decision(
     llm_provider: str,
 ) -> ActionPayload:
     """Sends screen context to the configured LLM provider and asks for the next move."""
-    if llm_provider not in ("openai", "openrouter", "ollama"):
+    if llm_provider not in ("openai", "openrouter", "ollama", "gemini"):
         raise ValueError(
-            f"Unknown LLM provider '{llm_provider}'. Use 'openai', 'openrouter', or 'ollama'."
+            f"Unknown LLM provider '{llm_provider}'. Use 'openai', 'openrouter', 'ollama', or 'gemini'."
         )
     LOGGER.info("Using LLM provider: %s", llm_provider)
     if llm_provider == "openai":
@@ -26,4 +27,6 @@ def get_llm_decision(
         return get_openrouter_decision(goal, screen_context)
     if llm_provider == "ollama":
         return get_ollama_decision(goal, screen_context)
+    if llm_provider == "gemini":
+        return get_gemini_decision(goal, screen_context)
     raise ValueError(f"Unknown LLM provider '{llm_provider}'.")
